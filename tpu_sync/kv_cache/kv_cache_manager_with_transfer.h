@@ -296,6 +296,12 @@ class KVCacheManagerWithTransfer {
       size_t layer_idx, size_t shard_idx, int block_id, uint64_t uuid,
       transport::BlockTransportDelegate::HostBlockReadyCallback cb);
 
+  // Plan-only DRAM receives have no H2D session, but their accepted network
+  // writers must drain before unregister allows the caller to reuse memory.
+  absl::flat_hash_set<uint64_t> draining_host_recvs_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<uint64_t, size_t> active_host_recv_ops_
+      ABSL_GUARDED_BY(mu_);
+
   absl::flat_hash_map<uint64_t, std::shared_ptr<TransferReceiveSession>>
       active_recv_sessions_ ABSL_GUARDED_BY(mu_);
 

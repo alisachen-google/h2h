@@ -232,7 +232,10 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
       } else if (auto reshard_it = active_pool_reshard_recvs_.find(uuid);
                  reshard_it != active_pool_reshard_recvs_.end()) {
         reshard_session = reshard_it->second;
+      } else if (draining_host_recvs_.contains(uuid)) {
+        return absl::CancelledError("Host receive is draining");
       } else if (uuid == 0 || base_->HasActivePlan(uuid)) {
+        if (uuid != 0) ++active_host_recv_ops_[uuid];
         return absl::OkStatus();
       } else {
         return absl::NotFoundError(
@@ -260,6 +263,11 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
                  reshard_it != active_pool_reshard_recvs_.end()) {
         reshard_session = reshard_it->second;
       } else {
+        if (auto host = active_host_recv_ops_.find(uuid);
+            host != active_host_recv_ops_.end() && --host->second == 0) {
+          active_host_recv_ops_.erase(host);
+          cv_.SignalAll();
+        }
         return absl::OkStatus();
       }
     }
@@ -752,6 +760,14 @@ absl::Status KVCacheManagerWithTransfer::UnregisterActivePlan(uint64_t uuid) {
                reshard_it != active_pool_reshard_recvs_.end() &&
                !reshard_it->second->Done()) {
       reshard_recv = reshard_it->second;
+    } else {
+      // Revoke admission under the same lock BeginIncomingPush uses, then
+      // drain accepted host writers before dropping their addressing plan.
+      draining_host_recvs_.insert(uuid);
+      while (active_host_recv_ops_.contains(uuid)) cv_.Wait(&mu_);
+      absl::Status status = base_->UnregisterActivePlanDirect(uuid);
+      draining_host_recvs_.erase(uuid);
+      return status;
     }
   }
   // Unregistering a live receive, on either the block-addressed or the

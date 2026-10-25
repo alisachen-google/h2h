@@ -247,5 +247,141 @@ class PollStatsWithDetailsTest(unittest.TestCase):
     self.assertEqual(failed.phase, "d2h")
 
 
+class _FakePushImpl:
+
+  def __init__(self):
+    self.calls = []
+
+  def push_registered_plan(self, *args):
+    self.calls.append(args)
+
+
+class H2hPushTest(unittest.TestCase):
+
+  def test_forwards_to_the_explicit_destination_push(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakePushImpl()  # pylint: disable=protected-access
+
+    manager.h2h_push(
+        peer="10.0.0.2:31000", src_block_ids=(1, 2), dst_block_ids=(7, 8), uuid=9
+    )
+
+    self.assertEqual(
+        manager._impl.calls,  # pylint: disable=protected-access
+        [(9, "10.0.0.2:31000", [1, 2], [7, 8], -1, 1)],
+    )
+
+  def test_rejects_empty_or_mismatched_block_lists(self):
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = _FakePushImpl()  # pylint: disable=protected-access
+
+    for src, dst in (([], []), ([1, 2], [7])):
+      with self.subTest(src=src, dst=dst):
+        with self.assertRaises(ValueError):
+          manager.h2h_push(peer="p", src_block_ids=src, dst_block_ids=dst, uuid=1)
+    self.assertEqual(manager._impl.calls, [])  # pylint: disable=protected-access
+
+  def test_transfer_failure_is_not_hidden(self):
+    class FailingImpl:
+      def push_registered_plan(self, *args):
+        raise RuntimeError("transfer failed")
+
+    manager = object.__new__(kv_cache_manager.KVCacheManager)
+    manager._impl = FailingImpl()  # pylint: disable=protected-access
+    with self.assertRaisesRegex(RuntimeError, "transfer failed"):
+      manager.h2h_push(peer="p", src_block_ids=[0], dst_block_ids=[1], uuid=1)
+
+  def test_independent_full_and_swa_host_pools(self):
+    def make(node_id, layers, block_bytes):
+      return kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+          num_layers=layers, num_shards=1, slice_byte_size=block_bytes,
+          node_id=node_id, host_blocks=4, parallelism=1,
+      )
+
+    # Pool geometries need not agree with one another, only with their peer.
+    for layers, block_bytes in ((2, 128), (1, 64)):
+      src, dst = make(5, layers, block_bytes), make(6, layers, block_bytes)
+      for layer in range(layers):
+        src.write_block_bytes(layer, 1, bytes([layer + 17]) * block_bytes)
+        dst.write_block_bytes(layer, 2, b"\xee" * block_bytes)
+      dst.h2h_register_recv(11)
+      src.h2h_push(peer=dst.transfer_address, src_block_ids=[1],
+                   dst_block_ids=[2], uuid=11)
+      dst.h2h_unregister_recv(11)
+      for layer in range(layers):
+        self.assertEqual(dst.read_block_bytes(layer, 2),
+                         bytes([layer + 17]) * block_bytes)
+
+  def test_receive_registration_is_required_and_revoked(self):
+    def make(node_id):
+      return kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+          num_layers=1, num_shards=1, slice_byte_size=128,
+          node_id=node_id, host_blocks=4, parallelism=1,
+      )
+    src, dst = make(7), make(8)
+    src.write_block_bytes(0, 0, b"\x01" * 128)
+    dst.write_block_bytes(0, 3, b"\xee" * 128)
+    dst.h2h_register_recv(13)
+    with self.assertRaisesRegex(RuntimeError, "already registered"):
+      dst.h2h_register_recv(13)
+    dst.h2h_unregister_recv(13)
+    with self.assertRaises(RuntimeError):
+      src.h2h_push(peer=dst.transfer_address, src_block_ids=[0],
+                   dst_block_ids=[3], uuid=13)
+    self.assertEqual(dst.read_block_bytes(0, 3), b"\xee" * 128)
+
+  def test_single_layer_does_not_overwrite_other_layers(self):
+    def make(node_id):
+      return kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+          num_layers=2, num_shards=1, slice_byte_size=128,
+          node_id=node_id, host_blocks=4, parallelism=1,
+      )
+
+    src, dst = make(3), make(4)
+    for layer in range(2):
+      src.write_block_bytes(layer, 0, bytes([layer + 1]) * 128)
+      dst.write_block_bytes(layer, 3, b"\xee" * 128)
+    dst.h2h_register_recv(7)
+    src.h2h_push(peer=dst.transfer_address, src_block_ids=[0],
+                 dst_block_ids=[3], uuid=7, layer_idx=1, parallelism=2)
+    dst.h2h_unregister_recv(7)
+    self.assertEqual(dst.read_block_bytes(0, 3), b"\xee" * 128)
+    self.assertEqual(dst.read_block_bytes(1, 3), b"\x02" * 128)
+
+  def test_pushes_host_blocks_into_named_peer_blocks(self):
+    def make(node_id):
+      return kv_cache_manager.KVCacheManager.create_host_only_for_testing(
+          num_layers=2,
+          num_shards=1,
+          slice_byte_size=128,
+          node_id=node_id,
+          host_blocks=4,
+          parallelism=1,
+      )
+
+    src, dst = make(1), make(2)
+    payload = {
+        (layer, block): bytes([16 * layer + block]) * 128
+        for layer in range(2)
+        for block in range(2)
+    }
+    for (layer, block), data in payload.items():
+      src.write_block_bytes(layer, block, data)
+    untouched = b"\xee" * 128
+    dst.write_block_bytes(0, 1, untouched)
+
+    # Blocks land at the ids the caller names, crossed on purpose.
+    dst.h2h_register_recv(5)
+    src.h2h_push(
+        peer=dst.transfer_address, src_block_ids=[0, 1], dst_block_ids=[3, 2], uuid=5
+    )
+    dst.h2h_unregister_recv(5)
+
+    for layer in range(2):
+      self.assertEqual(dst.read_block_bytes(layer, 3), payload[(layer, 0)])
+      self.assertEqual(dst.read_block_bytes(layer, 2), payload[(layer, 1)])
+    self.assertEqual(dst.read_block_bytes(0, 1), untouched)
+
+
 if __name__ == "__main__":
   unittest.main()

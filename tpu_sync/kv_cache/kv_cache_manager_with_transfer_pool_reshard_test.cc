@@ -20,6 +20,8 @@
 // exercised on real chips by the D-series harness.
 
 #include <cstddef>
+#include <chrono>
+#include <future>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -217,6 +219,34 @@ StartTransferRequest BlockPlan(int64_t uuid, const std::vector<int32_t>& src,
     entry->set_count(1);
   }
   return plan;
+}
+
+TEST(HostReceiveTest, UnregisterRevokesAdmissionAndDrainsAcceptedWriter) {
+  TestManager manager;
+  StartTransferRequest plan;
+  plan.set_uuid(981);
+  plan.set_dst_mem_type(MEMORY_TYPE_DRAM);
+  ASSERT_TRUE(manager.RegisterActivePlan(981, plan, false).ok());
+  ASSERT_TRUE(manager.base()->BeginIncomingPush(981).ok());
+  auto unregister = std::async(std::launch::async, [&] {
+    return manager.UnregisterActivePlan(981);
+  });
+  const auto deadline = absl::Now() + absl::Seconds(5);
+  absl::Status admission;
+  while (absl::Now() < deadline) {
+    admission = manager.base()->BeginIncomingPush(981);
+    if (!admission.ok()) break;
+    EXPECT_TRUE(manager.base()->EndIncomingPush(981).ok());
+    absl::SleepFor(absl::Milliseconds(1));
+  }
+  EXPECT_EQ(admission.code(), absl::StatusCode::kCancelled);
+  EXPECT_TRUE(manager.base()->HasActivePlan(981));
+  EXPECT_EQ(unregister.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::timeout);
+  // Also drain a failed writer; its destination cannot be recycled sooner.
+  EXPECT_TRUE(manager.base()->EndIncomingPush(
+      981, absl::InternalError("injected failed write")).ok());
+  EXPECT_TRUE(unregister.get().ok());
 }
 
 TEST(ExpectedPushSendersTest, CountsReceiverPlanSchedules) {

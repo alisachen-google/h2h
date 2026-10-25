@@ -27,6 +27,80 @@ To address these bottlenecks, we are introducing TPU Sync — an open-source, na
 
 ## 🛠️ Get Started
 
+### Local H2H development
+
+`KVCacheManager.h2h_push()` copies host KV blocks into explicit destination
+blocks in a peer host pool. It is synchronous, transfers all layers by default,
+and does not allocate HBM or acquire a staging slot. The destination arms a
+receive before advertising its pages. Internally, an empty DRAM receive plan
+authorizes direct host addressing; it schedules no H2D work.
+
+```python
+destination.h2h_register_recv(uuid=5)
+source.h2h_push(
+    peer=destination.transfer_address,
+    src_block_ids=[0, 1],
+    dst_block_ids=[3, 2],
+    uuid=5,
+)
+destination.h2h_unregister_recv(uuid=5)
+```
+
+Reserve both allocations until the call returns, and publish the destination
+only after success. Both managers must agree on block sizes and layer/shard
+layout. For FULL+SWA caches, use each pool's own manager and endpoint, and publish
+the session only after **both** pushes succeed. A failed copy can partially
+modify destination blocks.
+
+The Python API and native host-addressing change must be used together. Rebuild
+the native extension from this branch; selecting new Python sources over an old
+native wheel is insufficient (the old receiver rejects the transfer).
+
+For a full native local build, activate the intended Python 3.12 environment with
+its matching `torch` and `torch_tpu` installed, install `clang-18` and `patchelf`,
+and run (remove development links first so ABI-suffixed wheel binaries do
+not shadow the newly compiled extension):
+
+```bash
+find tpu_sync/frameworks/torch -maxdepth 1 -type l -name '*.so' -delete
+export BAZEL_OUTPUT_BASE=/path/with/space/tpu-sync-output
+export BAZEL_CACHE_DIR=/path/with/space/tpu-sync-cache
+./build.sh torch --jobs=8
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+python -m unittest tpu_sync.api.torch.kv_cache_manager_host_test
+```
+
+If the installed `torch_tpu` uses ABI-specific common libraries, the extension's
+NEEDED entry must match the selected library's SONAME. For the tested
+`torch==2.11.0+cpu` environment, after `build.sh`:
+
+```bash
+patchelf --replace-needed libpywrap_torch_tpu_common.so libpywrap_2_11_0_common.so \
+  tpu_sync/frameworks/torch/_tpu_raiden_torch.so
+python -c 'from tpu_sync.api.torch.kv_cache_manager import _torch_impl; print(_torch_impl().__file__)'
+```
+
+Use `readelf -d` on the installed `torch_tpu/common/glue_<version>/` common
+library to check its SONAME for another ABI. The loader preloads this library
+locally; its NEEDED dependency supplies Torch symbols without globally exporting
+XLA symbols. Do not use `LD_PRELOAD` to globally load the common library.
+
+`build.sh` compiles the native extensions into the checkout and installs its
+requirements. Use a dedicated development environment, because those requirements
+can change the installed dependency versions. `pip install -e .` is not a build
+path: this repository uses Bazel rather than a setuptools build backend.
+To produce an installable wheel instead, use the container build (Docker and
+sufficient disk space required):
+
+```bash
+RAIDEN_TORCH_ABIS=2.11.0 ci/build_wheel.sh torch
+python -m pip install --no-deps --force-reinstall dist/tpu_sync_torch-*.whl
+```
+
+Choose the ABI matching the serving environment. The host tests include actual
+loopback H2H copies with crossed destination IDs and per-layer isolation; they
+need the host extension but no TPU hardware.
+
 ### Latest Known Good (LKG) Revision
 Due to fast-paced active development, the `main` branch may occasionally contain temporary unstable changes. We publish the latest verified stable commit hash in the [`lkg.version`](lkg.version) file at the root of the repository.
 

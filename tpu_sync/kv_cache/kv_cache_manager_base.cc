@@ -3264,7 +3264,15 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
     return base_host_ptr + static_cast<size_t>(it->second) * block_size_bytes;
   };
 
-  if (!has_plan || uuid == 0) {
+  // An empty DRAM receive plan arms direct host writes without a strided
+  // schedule or staging allocation. The caller reserves the destination
+  // blocks and keeps the registration alive until the sender has finished.
+  const bool direct_host_receive =
+      has_plan && !plan_snapshot->is_sender &&
+      plan_snapshot->request.dst_mem_type() == ::tpu_sync::rpc::MEMORY_TYPE_DRAM &&
+      plan_snapshot->request.shard_push_schedules().empty() &&
+      plan_snapshot->request.pool_groups().empty();
+  if (!has_plan || uuid == 0 || direct_host_receive) {
     if (staging_bounded) {
       // Plan-less pushes address the full block-id space; bounded storages
       // only have host bytes for leased blocks of an active plan.

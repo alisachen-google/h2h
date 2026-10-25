@@ -316,6 +316,83 @@ class KVCacheManager:
         parallelism,
     )
 
+  def h2h_register_recv(self, uuid: int) -> None:
+    """Arm a host-only receive before advertising reserved destination blocks.
+
+    No device memory or staging slots are allocated. Keep destination blocks
+    reserved until the sender has finished, then call ``h2h_unregister_recv``.
+    This registration authorizes explicit host destinations in this manager;
+    the caller is responsible for block ownership and peer layout agreement.
+    """
+    if uuid <= 0:
+      raise ValueError("uuid must be positive")
+    from tpu_sync.rpc import raiden_service_pb2  # pylint: disable=g-import-not-at-top
+
+    request = raiden_service_pb2.StartTransferRequest(
+        uuid=uuid, dst_mem_type=raiden_service_pb2.MEMORY_TYPE_DRAM
+    )
+    self.register_active_plan(uuid, request, is_sender=False)
+
+  def h2h_unregister_recv(self, uuid: int) -> None:
+    """Disarm a host receive after its sender has stopped writing.
+
+    This is not cancellation: a timeout alone does not make destination
+    blocks safe to reuse. Wait for the sender's completion before disarming.
+    """
+    self.unregister_active_plan(uuid)
+
+  def h2h_push(
+      self,
+      *,
+      peer: str,
+      src_block_ids: Sequence[int],
+      dst_block_ids: Sequence[int],
+      uuid: int,
+      layer_idx: int = -1,
+      parallelism: int = 1,
+  ) -> None:
+    """Host-to-host (H2H) push: copies host blocks into a peer's host blocks.
+
+    Copies this manager's host blocks ``src_block_ids`` into the peer
+    manager's host blocks ``dst_block_ids`` over the block transport, every
+    layer unless ``layer_idx`` names one. No device memory and no staging slot
+    is touched on either side. The destination must call ``h2h_register_recv``
+    with the same ``uuid`` before the push. Blocks until the push has landed.
+
+    The caller owns both allocations: keep source blocks alive and unchanged
+    and destination blocks reserved until this call returns. Peers must have
+    matching layer/shard layouts and block sizes. Concurrent pushes must not
+    write overlapping destination blocks. A failed push can leave a partial
+    destination; do not publish it to readers.
+
+    Args:
+      peer: The peer manager's ``transfer_address``.
+      src_block_ids: Host block ids in this manager's host pool.
+      dst_block_ids: Host block ids in the peer's host pool, same length.
+      uuid: Transfer label, unique per in-flight push from this manager.
+      layer_idx: One layer, or -1 for all layers.
+      parallelism: Parallel network copies per layer.
+
+    Raises:
+      ValueError: The block id lists are empty or differ in length.
+      RuntimeError: The push failed.
+    """
+    if uuid <= 0:
+      raise ValueError("uuid must be positive")
+    if not src_block_ids or len(src_block_ids) != len(dst_block_ids):
+      raise ValueError(
+          "src_block_ids and dst_block_ids must be non-empty and the same"
+          " length"
+      )
+    self._impl.push_registered_plan(
+        uuid,
+        peer,
+        list(src_block_ids),
+        list(dst_block_ids),
+        layer_idx,
+        parallelism,
+    )
+
   def read_block_bytes(self, layer_idx: int, block_id: int) -> bytes:
     """Returns one host block as bytes."""
     return self._impl.read_block_bytes(layer_idx, block_id)
